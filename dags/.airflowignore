@@ -1,0 +1,4 @@
+# Files the dag-processor must NOT parse as DAG files (glob syntax, like .gitignore).
+# They are plain modules imported by the *_dag.py files.
+common/
+*_task.py

@@ -1,0 +1,160 @@
+# Airflow_Banking — Airflow 3 (LocalExecutor) that schedules the Spark jobs of LakeHouse_Banking.
+# Tasks run `docker exec spark-client-dungafk spark-submit /home/spark/jobs/...` through the host Docker socket,
+# so the LakeHouse_Banking stack (docker compose project in ../LakeHouse_Banking) must be up for jobs to run.
+# Based on the official docker-compose.yaml of Airflow 3.3.2 (Celery/Redis removed, LocalExecutor instead).
+
+x-airflow-common: &airflow-common
+  build:
+    context: ./docker/airflow
+    dockerfile: Dockerfile
+  image: airflow-banking:3.3.2
+  env_file:
+    - .env
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_USER}:${AIRFLOW_DB_PASSWORD}@airflow-postgres-dungafk:5432/${AIRFLOW_DB_NAME}
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"   # new DAGs never run until switched on in the UI
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DEFAULT_TIMEZONE: Asia/Ho_Chi_Minh
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver-dungafk:8080/execution/
+    # Must be the same in every Airflow container, or tasks fail with "invalid token"
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET}
+    AIRFLOW__API_AUTH__JWT_ISSUER: airflow-banking
+    AIRFLOW__API__SECRET_KEY: ${AIRFLOW_API_SECRET_KEY}
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    AIRFLOW__WEBSERVER__DEFAULT_UI_TIMEZONE: Asia/Ho_Chi_Minh
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+  user: "${AIRFLOW_UID}:0"
+  restart: unless-stopped
+  networks:
+    - airflow-net-dungafk
+  depends_on: &airflow-common-depends-on
+    airflow-postgres-dungafk:
+      condition: service_healthy
+
+services:
+  # ── Metadata database (Airflow only; the banking source DB stays in postgres-dungafk) ──
+  airflow-postgres-dungafk:
+    image: postgres:16-alpine
+    container_name: airflow-postgres-dungafk
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${AIRFLOW_DB_USER}
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD}
+      POSTGRES_DB: ${AIRFLOW_DB_NAME}
+    volumes:
+      - airflow_postgres_data:/var/lib/postgresql/data
+    # No host port: only Airflow containers talk to it (host 5432 is taken by postgres-dungafk)
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${AIRFLOW_DB_USER} -d ${AIRFLOW_DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    networks:
+      - airflow-net-dungafk
+
+  # ── One-shot init: migrate the metadata DB, create the UI admin user and the Spark pool ──
+  airflow-init-dungafk:
+    <<: *airflow-common
+    container_name: airflow-init-dungafk
+    restart: "no"
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -e
+        mkdir -p /opt/airflow/logs /opt/airflow/dags
+        chown -R "${AIRFLOW_UID}:0" /opt/airflow/logs
+        /entrypoint airflow version
+        /entrypoint airflow pools set ${SPARK_POOL} ${SPARK_POOL_SLOTS} "Spark jobs running at the same time on spark-client-dungafk"
+        echo "Airflow init done."
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_ADMIN_USER}
+      _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD}
+    user: "0:0"
+
+  # ── UI + REST API + execution API (tasks report back here) ──
+  airflow-apiserver-dungafk:
+    <<: *airflow-common
+    container_name: airflow-apiserver-dungafk
+    command: api-server
+    ports:
+      - "8090:8080"   # host 8080 is taken by the Spark Master UI
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init-dungafk:
+        condition: service_completed_successfully
+
+  # ── Scheduler: with LocalExecutor it also RUNS the tasks, so only it gets the Docker socket ──
+  airflow-scheduler-dungafk:
+    <<: *airflow-common
+    container_name: airflow-scheduler-dungafk
+    command: scheduler
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+      - /var/run/docker.sock:/var/run/docker.sock   # docker exec into spark-client-dungafk
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init-dungafk:
+        condition: service_completed_successfully
+
+  # ── Parses the files in dags/ ──
+  airflow-dag-processor-dungafk:
+    <<: *airflow-common
+    container_name: airflow-dag-processor-dungafk
+    command: dag-processor
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init-dungafk:
+        condition: service_completed_successfully
+
+  # ── Runs deferrable tasks / sensors (future: flag checks) ──
+  airflow-triggerer-dungafk:
+    <<: *airflow-common
+    container_name: airflow-triggerer-dungafk
+    command: triggerer
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init-dungafk:
+        condition: service_completed_successfully
+
+volumes:
+  airflow_postgres_data:
+
+networks:
+  airflow-net-dungafk:
+    driver: bridge
+    name: airflow-net-dungafk
