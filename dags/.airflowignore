@@ -1,4 +1,5 @@
 # Files the dag-processor must NOT parse as DAG files (glob syntax, like .gitignore).
-# They are plain modules imported by the *_dag.py files.
+# common/ = shared modules, auto/ = the DAG generator, *_task.py = modules imported by the *_dag.py files.
 common/
+auto/
 *_task.py

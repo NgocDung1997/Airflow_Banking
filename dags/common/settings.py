@@ -23,6 +23,21 @@ LAKEHOUSE_JOBS_ROOT = os.environ.get("LAKEHOUSE_JOBS_ROOT", "/home/spark/jobs")
 # Airflow pool limiting how many Spark jobs run at the same time (created by airflow-init-dungafk)
 SPARK_POOL = os.environ.get("SPARK_POOL", "spark_jobs")
 
+# Flag store (common/flags.py): database ETL_CONTROL_DB_NAME on the Airflow metadata Postgres, same login
+CONTROL_DB = {
+    "host": os.environ.get("ETL_CONTROL_DB_HOST", "airflow-postgres-dungafk"),
+    "port": int(os.environ.get("ETL_CONTROL_DB_PORT", "5432")),
+    "dbname": os.environ.get("ETL_CONTROL_DB_NAME", "etl_control"),
+    "user": os.environ.get("AIRFLOW_DB_USER"),
+    "password": os.environ.get("AIRFLOW_DB_PASSWORD"),
+}
+# Database used only to CREATE the control database on first start (the Airflow metadata DB)
+BOOTSTRAP_DB_NAME = os.environ.get("AIRFLOW_DB_NAME", "postgres")
+
+# How a silver DAG waits for the flags of its sources (sensor in reschedule mode: no worker slot held while waiting)
+FLAG_POKE_INTERVAL = timedelta(minutes=1)
+FLAG_WAIT_TIMEOUT = timedelta(hours=4)
+
 # Default arguments of every task
 DEFAULT_ARGS = {
     "owner": "lakehouse",

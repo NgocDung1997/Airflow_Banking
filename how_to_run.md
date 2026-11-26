@@ -12,7 +12,8 @@ docker compose up -d
 docker compose ps                # all airflow-* "healthy"; airflow-init-dungafk "Exited (0)" is normal
 ```
 
-`airflow-init-dungafk` runs once per `up`: migrates the metadata DB, creates the UI admin user and the pool `spark_jobs`.
+`airflow-init-dungafk` runs on every `up`: migrates the metadata DB, creates the UI admin user, the pool
+`spark_jobs`, and the flag database `etl_control` with its tables (all idempotent).
 
 UI: http://localhost:8090 — user / password = `AIRFLOW_ADMIN_USER` / `AIRFLOW_ADMIN_PASSWORD` in `.env`.
 
@@ -21,44 +22,63 @@ UI: http://localhost:8090 — user / password = `AIRFLOW_ADMIN_USER` / `AIRFLOW_
 | What | How |
 |---|---|
 | Switch a DAG on / off | UI → DAGs → toggle (all DAGs start paused) |
-| Run now with T-1 | UI → DAG → Trigger (leave params empty) |
-| Run one date | UI → DAG → Trigger → `cob_dt` = `2026-11-23` |
-| Backfill a range | UI → DAG → Trigger → `from_dt` + `to_dt` (not for bronze snapshot DAGs) |
-| Full load | UI → DAG → Trigger → `full_load` = true (not for bronze snapshot DAGs) |
+| Run a bronze domain now (T-1) | UI → `bronze__<domain>` → Trigger (leave params empty) |
+| Run one date | Trigger → `cob_dt` = `2026-11-23` |
+| Backfill a range | Trigger → `from_dt` + `to_dt` (snapshot tables are skipped) |
+| Full load | Trigger → `full_load` = true (no flags written) |
+| Silver without waiting for flags | Trigger → `skip_flag_check` = true (manual reloads only) |
+| Re-run only the failed table of a domain run | UI → DAG run → failed task → Clear (downstream too) |
 | See the Spark output | UI → DAG run → task → Logs |
+| Why is a silver DAG waiting? | Log of `check_source_flags`: "Waiting: bronze.x.y cob_dt ... is not loaded (no flag)" |
 
 From the command line (runs the DAG once in the scheduler container, even when paused):
 
 ```powershell
-docker exec airflow-scheduler-dungafk airflow dags test bronze__customer -c '{\"cob_dt\": \"2026-11-23\"}'
-```
-
-```powershell
-docker exec airflow-scheduler-dungafk airflow dags list
+docker exec airflow-scheduler-dungafk airflow dags test bronze__crm -c '{\"cob_dt\": \"2026-11-23\"}'
 ```
 
 ```powershell
 docker exec airflow-scheduler-dungafk airflow dags list-import-errors
 ```
 
-## 3. Add a table
+## 3. Flags
 
-1. Make sure the LakeHouse job exists: `LakeHouse_Banking/jobs/<layer>/<domain>/<layer>__<table>.py`.
-2. Copy the two files of a similar table in `dags/<layer>/<domain>/` and rename them `<layer>__<table>_dag.py` /
-   `<layer>__<table>_task.py`.
-3. In the task file: job path, `DATE_MODE` (`COB_DT_ONLY` / `DATE_RANGE` / `NO_DATE`), function and task name.
-4. In the DAG file: the import, `dag_id`, description, schedule, tags.
-5. Wait ~30 s, then `airflow dags list-import-errors` must show nothing.
+```powershell
+docker exec airflow-postgres-dungafk psql -U airflow_dungnn -d etl_control -c "SELECT layer, schema_name, table_name, cob_dt, status, finished_at, message FROM job_flag ORDER BY cob_dt DESC, layer, table_name"
+```
 
-## 4. Stack changes
+- History of every change: table `job_flag_history`.
+- To force a re-check, fix the source (re-run the bronze table) — do not edit flags by hand unless you know why.
+
+## 4. Add / change a table (generator)
+
+1. Bronze: add the table to `LakeHouse_Banking/jobs/auto/bronze_tables.csv` and generate its LakeHouse job first
+   (see LakeHouse_Banking/how_to_run.md). A new domain also needs a line in `dags/auto/config/bronze_domains.csv`.
+2. Silver: create the LakeHouse job `jobs/silver/<ns>/silver__<table>.py`, then add a line to
+   `dags/auto/config/silver_tables.csv` (`source_tables` = flags to wait for, `|`-separated).
+3. Generate:
+
+```powershell
+python dags/auto/generate_dags.py --check
+```
+
+```powershell
+python dags/auto/generate_dags.py
+```
+
+4. Wait ~30 s; `airflow dags list-import-errors` must show nothing. `active = 0` removes the generated files.
+   A DAG whose file was removed stays in the UI with its history; delete it with
+   `docker exec airflow-scheduler-dungafk airflow dags delete <dag_id> -y` when no longer needed.
+
+## 5. Stack changes
 
 - After changing `.env` or `docker-compose.yml`: `docker compose up -d --force-recreate`.
 - After changing the Dockerfile: `docker compose build` then `docker compose up -d`.
 - DAG files are mounted: changes are picked up by the dag-processor without restart.
 - `AIRFLOW_DB_*` are read only when the volume `airflow_postgres_data` is empty (first start).
-- `docker compose down -v` deletes the metadata DB (run history, users) — ask first.
+- `docker compose down -v` deletes the metadata DB **and the flags** — ask first.
 
-## 5. Stop
+## 6. Stop
 
 ```powershell
 docker compose down

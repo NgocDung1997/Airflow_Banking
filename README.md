@@ -1,7 +1,7 @@
 # Airflow_Banking
 
 Airflow for jobs in the Banking domain: Airflow 3 (LocalExecutor) in Docker that schedules the Spark jobs of
-[LakeHouse_Banking](../LakeHouse_Banking) (bronze and silver layers).
+[LakeHouse_Banking](../LakeHouse_Banking) (bronze and silver layers), with a flag table so silver waits for bronze.
 
 Commands: [how_to_run.md](how_to_run.md) · Problems already met: [known_issues/README.md](known_issues/README.md)
 
@@ -14,19 +14,75 @@ Commands: [how_to_run.md](how_to_run.md) · Problems already met: [known_issues/
  │ airflow-scheduler-dungafk   runs tasks ──┼── docker ──┼─▶ spark-submit /home/spark/jobs/<layer>/...   │
  │ airflow-dag-processor-dungafk            │    exec    │      │                                        │
  │ airflow-triggerer-dungafk                │  (socket)  │      ▼                                        │
- │ airflow-postgres-dungafk  metadata DB    │            │ spark-master / worker → Iceberg on MinIO      │
- └──────────────────────────────────────────┘            └───────────────────────────────────────────────┘
+ │ airflow-postgres-dungafk                 │            │ spark-master / worker → Iceberg on MinIO      │
+ │   ├─ airflow_db   (Airflow metadata)     │            └───────────────────────────────────────────────┘
+ │   └─ etl_control  (job flags)            │
+ └──────────────────────────────────────────┘
 ```
 
-- **One task = one LakeHouse job.** A task runs
-  `docker exec spark-client-dungafk spark-submit /home/spark/jobs/<layer>/<domain>/<layer>__<table>.py <date options>`
-  through the host Docker socket (mounted into the scheduler only; with LocalExecutor the scheduler runs the tasks).
-  The task fails when spark-submit fails; the whole Spark output is in the task log.
-- The two stacks are separate compose projects. Airflow does not join the LakeHouse network (it does not need to:
-  `docker exec` goes through the Docker daemon). The LakeHouse stack must be up for jobs to run.
-- Job code lives only in LakeHouse_Banking; this repo holds only scheduling.
-- Metadata DB: its own Postgres (`airflow-postgres-dungafk`, no host port), apart from the banking source DB.
+- **One task = one LakeHouse job**: `docker exec spark-client-dungafk spark-submit /home/spark/jobs/<...>.py <dates>`
+  through the host Docker socket (scheduler only; LocalExecutor runs tasks there). The task fails when spark-submit
+  fails; the whole Spark output is in the task log.
+- Job code lives only in LakeHouse_Banking; this repo holds scheduling, flags and the DAG generator.
 - Pool `spark_jobs` (2 slots) limits Spark jobs running at the same time on the one Spark worker.
+
+## DAGs (all generated, all start paused)
+
+| DAG | Tasks | Schedule (Vietnam time) |
+|---|---|---|
+| bronze__crm | ingest_customer → domain_done | 01:00 |
+| bronze__core_banking | ingest_account → ingest_core_account → ingest_transaction → domain_done | 01:00 |
+| bronze__payment | ingest_merchant_transaction → domain_done | 01:00 |
+| silver__dim_date | load_dim_date | manual only |
+| silver__dim_party | check_source_flags (bronze.crm.customer) → load_dim_party | 02:00 |
+| silver__dim_account | check_source_flags (bronze.core_banking.account) → load_dim_account | 02:00 |
+| silver__dim_party_identity | check_source_flags (bronze.crm.customer) → load_dim_party_identity | 02:15 |
+| silver__dim_contact | check_source_flags (bronze.crm.customer) → load_dim_contact | 02:15 |
+| silver__fact_account_balance | check_source_flags (bronze.core_banking.account) → load_fact_account_balance | 02:30 |
+| silver__fact_transaction | check_source_flags (bronze.core_banking.transaction) → load_fact_transaction | 02:30 |
+| silver__fact_merchant_transaction | check_source_flags (bronze.payment.merchant_transaction) → load_fact_merchant_transaction | 02:30 |
+
+**Bronze — one DAG per domain.** Tables run one after another in the order of `bronze_tables.csv`. A failed table
+does **not** stop the next ones (`trigger_rule="all_done"`); the last task `domain_done` (`none_failed`) then becomes
+`upstream_failed`, so the run shows as failed and the failed table is easy to spot (clear that task to re-run it).
+
+**Silver — one DAG per table, with a flag check.** `check_source_flags` is a sensor (reschedule mode, every 1 min,
+up to 4 h) that waits until every source table has a `SUCCESS` flag for every date of the run; only then the load runs.
+
+## Flags (`etl_control` database)
+
+| Table | Content |
+|---|---|
+| `job_flag` | current state, one row per (layer, schema_name, table_name, cob_dt): status RUNNING / SUCCESS / FAILED, dag / run / task / try, started_at, finished_at, message |
+| `job_flag_history` | every state change, append-only |
+
+Every Spark task writes its own table's flags: RUNNING before spark-submit, then SUCCESS (exit 0) or FAILED.
+Silver tables write flags too (`silver.<ns>.<table>`), ready for gold later. Code: `dags/common/flags.py`.
+
+**Which dates** (`dags/common/spark_job.py`, `resolve_dates`):
+
+| Run with | Job gets | Flags written / checked for |
+|---|---|---|
+| nothing (scheduled) | `--cob-dt` = run date (VN time) − 1 | that date |
+| `cob_dt` | `--cob-dt X` | X |
+| `from_dt` + `to_dt` | `--from-dt X --to-dt Y` (snapshot tables: **skipped**) | every day X..Y |
+| `full_load` = true | no date (snapshot tables: T-1) | none (nothing to check) |
+| `skip_flag_check` = true (silver) | as above | flags not checked |
+
+## Generator
+
+```
+dags/auto/
+├── generate_dags.py            # python dags/auto/generate_dags.py  (writes / updates / deletes generated files)
+├── config/
+│   ├── bronze_domains.csv      # domain, schedule, active
+│   └── silver_tables.csv       # namespace, table, date_mode, schedule, source_tables ("|"-separated), active
+└── templates/                  # job_task.py.tpl, bronze_domain_dag.py.tpl, silver_table_dag.py.tpl
+```
+
+Bronze tables come from **LakeHouse_Banking/jobs/auto/bronze_tables.csv** (the same list the LakeHouse bronze jobs
+are generated from); snapshot → `COB_DT_ONLY`, incremental → `DATE_RANGE`. The generator checks that every LakeHouse
+job file exists. Generated files start with `# GENERATED by dags/auto/generate_dags.py` — never edit them by hand.
 
 ## Layout
 
@@ -38,43 +94,9 @@ Airflow_Banking/
 ├── logs/                       # Airflow logs, git-ignored
 ├── known_issues/README.md
 └── dags/
-    ├── .airflowignore          # common/ and *_task.py are modules, not DAG files
-    ├── common/
-    │   ├── settings.py         # time zone, start date, container / jobs path, pool, default_args
-    │   └── spark_job.py        # spark_job_task(): the docker exec task + date params / date options
-    ├── bronze/<domain>/
-    │   ├── bronze__<table>_dag.py    # WHEN and in which ORDER: schedule, params, task flow
-    │   └── bronze__<table>_task.py   # WHAT: which LakeHouse job the task calls
-    └── silver/{base,pii}/
-        ├── silver__<table>_dag.py
-        └── silver__<table>_task.py
+    ├── .airflowignore          # common/, auto/ and *_task.py are not DAG files
+    ├── common/                 # settings.py, spark_job.py (tasks), flags.py (flag store)
+    ├── auto/                   # generator + config + templates
+    ├── bronze/<domain>/        # bronze__<domain>_dag.py + bronze__<table>_task.py   (generated)
+    └── silver/{base,pii}/      # silver__<table>_dag.py + silver__<table>_task.py    (generated)
 ```
-
-**Two files per table** (user decision 2026-11-26): `<layer>__<table>_dag.py` holds the schedule and the task flow;
-`<layer>__<table>_task.py` holds the task(s) that call the LakeHouse job. Today each DAG has one task; later a DAG
-can grow to e.g. *check source flag → ingest → save flag* without touching the task file of the job.
-DAG id = `<layer>__<table>` (same name as the LakeHouse job file).
-
-## DAGs
-
-| DAG | LakeHouse job | Dates | Schedule (Vietnam time) |
-|---|---|---|---|
-| bronze__customer | bronze/crm/bronze__customer.py | cob_dt only (snapshot) | 01:00 daily |
-| bronze__account | bronze/core_banking/bronze__account.py | cob_dt only (snapshot) | 01:00 daily |
-| bronze__core_account | bronze/core_banking/bronze__core_account.py | cob_dt only (snapshot) | 01:00 daily |
-| bronze__transaction | bronze/core_banking/bronze__transaction.py | cob_dt / range / full | 01:00 daily |
-| bronze__merchant_transaction | bronze/payment/bronze__merchant_transaction.py | cob_dt / range / full | 01:00 daily |
-| silver__dim_date | silver/base/silver__dim_date.py | none | manual only |
-| silver__dim_party | silver/base/silver__dim_party.py | cob_dt / range / full | 02:00 daily |
-| silver__dim_account | silver/base/silver__dim_account.py | cob_dt / range / full | 02:00 daily |
-| silver__dim_party_identity | silver/pii/silver__dim_party_identity.py | cob_dt / range / full | 02:15 daily |
-| silver__dim_contact | silver/pii/silver__dim_contact.py | cob_dt / range / full | 02:15 daily |
-| silver__fact_account_balance | silver/base/silver__fact_account_balance.py | cob_dt / range / full | 02:30 daily |
-| silver__fact_transaction | silver/base/silver__fact_transaction.py | cob_dt / range / full | 02:30 daily |
-| silver__fact_merchant_transaction | silver/base/silver__fact_merchant_transaction.py | cob_dt / range / full | 02:30 daily |
-
-All DAGs start **paused**. Order between DAGs is only by clock time for now (no cross-DAG dependency yet).
-
-**Which date a run passes** (`dags/common/spark_job.py`): params `from_dt`+`to_dt` → `--from-dt/--to-dt`;
-`full_load=true` → no date (= full load in LakeHouse); `cob_dt` → `--cob-dt`; nothing (scheduled run) →
-`--cob-dt` = run date in Vietnam time − 1 day.

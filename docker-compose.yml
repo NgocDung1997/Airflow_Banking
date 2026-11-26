@@ -58,7 +58,7 @@ services:
     networks:
       - airflow-net-dungafk
 
-  # ── One-shot init: migrate the metadata DB, create the UI admin user and the Spark pool ──
+  # ── One-shot init: migrate the metadata DB, create the UI admin user, the Spark pool and the flag DB ──
   airflow-init-dungafk:
     <<: *airflow-common
     container_name: airflow-init-dungafk
@@ -72,6 +72,8 @@ services:
         chown -R "${AIRFLOW_UID}:0" /opt/airflow/logs
         /entrypoint airflow version
         /entrypoint airflow pools set ${SPARK_POOL} ${SPARK_POOL_SLOTS} "Spark jobs running at the same time on spark-client-dungafk"
+        # Flag store: database ${ETL_CONTROL_DB_NAME} + tables job_flag / job_flag_history (idempotent)
+        cd /opt/airflow/dags && /entrypoint python -m common.flags
         echo "Airflow init done."
     environment:
       <<: *airflow-common-env
