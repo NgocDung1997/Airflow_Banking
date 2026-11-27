@@ -80,13 +80,15 @@ line in `known_issues/README.md` in the same turn. Never add git / Git Bash issu
 ## 3. Current status
 
 **Last updated:** 2026-11-27
-- Stack up and healthy; 18 generated DAGs (4 bronze domain DAGs: `bronze__crm`, `bronze__t24`, `bronze__payment`, `bronze__los`;
-  14 silver table DAGs: 8 original + 6 LOS `dim_dpd_classification`, `dim_loan_product`, `dim_loan_contract`,
-  `fact_loan_balance`, `fact_repayment`, `fact_loan_application`), no import errors, all paused.
+- Stack up and healthy; 20 generated DAGs (6 bronze domain DAGs: `bronze__crm`, `bronze__t24`, `bronze__payment`,
+  `bronze__los`, `bronze__card`, `bronze__ref`; 14 silver table DAGs: 8 original + 6 LOS `dim_dpd_classification`,
+  `dim_loan_product`, `dim_loan_contract`, `fact_loan_balance`, `fact_repayment`, `fact_loan_application`), no import
+  errors, all paused.
 - Silver → silver parent dependencies implemented (single source of truth = LakeHouse YAML `job_parents`; `exact` for
   bronze & facts, `latest` for SCD1/2/3 dims; topological cycle detection in `generate_dags.py`).
 - `bronze__loan_application_task.py` switched to `COB_DT_ONLY` (snapshot).
 - Verified 2026-11-27: `not_ready` unit checks (`exact` / `latest` / invalid mode), cycle detection, waiting sensor
-  (`Waiting: ... (latest ≤ ...)`), and end-to-end `dags test` for `bronze__los`, `silver__fact_transaction`,
-  `silver__dim_loan_product`, `silver__dim_loan_contract`, `silver__fact_loan_balance` on `2026-11-23`.
+  (`Waiting: ... (latest ≤ ...)`), and end-to-end `dags test` for `bronze__los`, `bronze__card`, `bronze__ref`,
+  `silver__fact_transaction`, `silver__dim_loan_product`, `silver__dim_loan_contract`, `silver__fact_loan_balance`
+  on `2026-11-23`.
 - Not built yet: DQ, gold. Nothing committed to git yet (remote origin = NgocDung1997/Airflow_Banking, branch main).

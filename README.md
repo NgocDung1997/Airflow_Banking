@@ -34,7 +34,8 @@ Commands: [how_to_run.md](how_to_run.md) · Problems already met: [known_issues/
 | bronze__t24 | ingest_account → ingest_core_account → ingest_transaction → domain_done | 01:00 |
 | bronze__payment | ingest_merchant_transaction → domain_done | 01:00 |
 | bronze__los | ingest_loan_product → ingest_loan_application → ingest_loan_contract → ingest_repayment → domain_done | 01:00 |
-| bronze__los | ingest_loan_product → ingest_loan_application → ingest_loan_contract → ingest_repayment → domain_done | 01:00 |
+| bronze__card | ingest_card → ingest_card_txn → domain_done | 01:00 |
+| bronze__ref | ingest_branch → ingest_product → ingest_gl_mapping → domain_done | 01:00 |
 | silver__dim_date | load_dim_date | manual only |
 | silver__dim_dpd_classification | load_dim_dpd_classification | manual only |
 | silver__dim_party | check_source_flags (bronze.crm.customer exact) → load_dim_party | 02:00 |
