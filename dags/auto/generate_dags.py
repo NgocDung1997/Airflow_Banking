@@ -5,8 +5,9 @@ Inputs
     Bronze tables  LakeHouse_Banking/jobs/auto/bronze_tables.csv     (the SAME list the LakeHouse bronze jobs are
                                                                       generated from: one source of truth)
     Bronze DAGs    dags/auto/config/bronze_domains.csv               schedule per domain
-    Silver tables  dags/auto/config/silver_tables.csv                namespace, table, date mode, schedule,
-                                                                      source tables (flags to wait for, "|"-separated)
+    Silver tables  dags/auto/config/silver_tables.csv                namespace, table, date mode, schedule
+                                                                      (parent flags are derived from LakeHouse YAML
+                                                                      job_description.job_parents)
     Templates      dags/auto/templates/*.py.tpl                      (string.Template, $placeholders)
 
 Outputs (every file starts with the GENERATED marker — never edit them by hand, re-run this script)
@@ -28,7 +29,9 @@ import re
 import sys
 from pathlib import Path
 from string import Template
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
+
+import yaml
 
 AUTO_DIR = Path(__file__).resolve().parent
 DAGS_DIR = AUTO_DIR.parent
@@ -118,50 +121,159 @@ def load_bronze(lakehouse: Path, tables_csv: Path) -> Dict[str, Dict[str, object
         domain_active, schedule = schedules[domain]
         if not domain_active:
             continue
-        job_rel = f"bronze/{domain}/bronze__{table}.py"
+        job_rel = f"bronze/{domain}/bronze__{domain}__{table}.py"
         check_job(lakehouse, job_rel, where)
         entry = result.setdefault(domain, {"schedule": schedule, "tables": []})
         entry["tables"].append({
             "table": table, "job_rel": job_rel, "date_mode": LOAD_TYPE_MODE[row["load_type"]],
-            "description": f"Bronze {row['load_type']}: postgres {row['source_domain']}.{row['source_table']}"
+            "description": f"Bronze {row['load_type']}: {row.get('source_system') or 'postgres'} {row['source_domain']}.{row['source_table']}"
                            f" → Iceberg bronze.{domain}.{table}",
         })
     return result
 
 
+EXACT_WRITE_MODES = {"overwrite_partitions", "append"}
+LATEST_WRITE_MODES = {"scd1", "scd2", "scd3"}
+
+
+def _parse_parent_code(job_code: str, where: str) -> Tuple[str, str, str]:
+    """'bronze__t24__transaction' → ('bronze', 't24', 'transaction'). Splits on '__', exactly 3 parts."""
+    if not isinstance(job_code, str):
+        raise ConfigError(f"{where}: parent job_code must be a string, got {job_code!r}")
+    parts = job_code.split("__")
+    if len(parts) != 3 or parts[0] not in ("bronze", "silver") or not all(parts):
+        raise ConfigError(f"{where}: parent {job_code!r} must be '<bronze|silver>__<domain_or_ns>__<table>'")
+    return parts[0], parts[1], parts[2]
+
+
+def _load_yaml(path: Path, where: str) -> Dict[str, object]:
+    if not path.is_file():
+        raise ConfigError(f"{where}: YAML file not found: {path}")
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ConfigError(f"{where}: invalid YAML root in {path}")
+    return data
+
+
+def _check_no_cycles(graph: Dict[str, List[str]]) -> None:
+    """Detect any cycle in the silver dependency graph (node → list of silver parent nodes)."""
+    state: Dict[str, int] = {}   # 0/absent = unvisited, 1 = visiting, 2 = done
+    stack: List[str] = []
+
+    def dfs(node: str) -> None:
+        state[node] = 1
+        stack.append(node)
+        for parent in graph.get(node, []):
+            if state.get(parent) == 1:
+                cycle = stack[stack.index(parent):] + [parent]
+                raise ConfigError("cycle in silver job_parents: " + " -> ".join(cycle))
+            if state.get(parent, 0) == 0:
+                dfs(parent)
+        stack.pop()
+        state[node] = 2
+
+    for node in sorted(graph):
+        if state.get(node, 0) == 0:
+            dfs(node)
+
+
 def load_silver(lakehouse: Path, bronze_tables: List[str]) -> List[Dict[str, object]]:
     rows = read_csv(CONFIG_DIR / "silver_tables.csv",
-                    ["namespace", "table", "date_mode", "schedule", "source_tables", "active"])
-    known = set(bronze_tables)
-    result, seen = [], set()
+                    ["namespace", "table", "date_mode", "schedule", "active"])
+    known_bronze = set(bronze_tables)
+
+    # Pass 1: parse active silver rows and read their YAML (if present)
+    entries = []
+    seen_tables = set()
+    active_silver: Dict[str, Dict[str, object]] = {}   # "silver.<ns>.<table>" -> entry
     for i, row in enumerate(rows, start=2):
         where = f"silver_tables.csv line {i}"
         if not is_active(row, where):
             continue
         namespace = check_name(row["namespace"], "namespace", where)
         table = check_name(row["table"], "table", where)
-        if table in seen:
+        if table in seen_tables:
             raise ConfigError(f"{where}: silver table {table} listed twice")
-        seen.add(table)
+        seen_tables.add(table)
         if row["date_mode"] not in DATE_MODES:
             raise ConfigError(f"{where}: date_mode must be one of {sorted(DATE_MODES)}, got {row['date_mode']!r}")
-        sources = [s.strip() for s in row["source_tables"].split("|") if s.strip()]
-        for source in sources:
-            parts = source.split(".")
-            if len(parts) != 3 or parts[0] not in ("bronze", "silver"):
-                raise ConfigError(f"{where}: source {source!r} must be '<bronze|silver>.<schema>.<table>'")
-            if parts[0] == "bronze" and source not in known:
-                raise ConfigError(f"{where}: source {source} is not an active bronze table")
-        if sources and row["date_mode"] == "no_date":
-            raise ConfigError(f"{where}: a no_date table cannot wait for dated source flags")
-        job_rel = f"silver/{namespace}/silver__{table}.py"
-        check_job(lakehouse, job_rel, where)
-        result.append({
-            "namespace": namespace, "table": table, "job_rel": job_rel, "date_mode": DATE_MODES[row["date_mode"]],
-            "schedule": schedule_literal(row["schedule"], where), "sources": sources,
-            "description": f"Silver: {', '.join(sources) if sources else '(no source table)'}"
-                           f" → silver.{namespace}.{table}",
-        })
+
+        job_code = f"silver__{namespace}__{table}"
+        flag_table = f"silver.{namespace}.{table}"
+        yaml_rel = f"silver/{namespace}/{job_code}.yaml"
+        yaml_path = lakehouse / "jobs" / yaml_rel
+        py_rel = f"silver/{namespace}/{job_code}.py"
+        if yaml_path.is_file():
+            cfg = _load_yaml(yaml_path, f"{where} ({job_code})")
+            desc = cfg.get("job_description")
+            if not isinstance(desc, dict) or not isinstance(desc.get("job_parents"), list):
+                raise ConfigError(f"{yaml_rel} ({job_code}): job_description.job_parents must be a list")
+            tgt = cfg.get("target")
+            write_mode = tgt.get("write_mode") if isinstance(tgt, dict) else None
+            if write_mode not in (EXACT_WRITE_MODES | LATEST_WRITE_MODES):
+                raise ConfigError(f"{yaml_rel} ({job_code}): missing or unknown target.write_mode {write_mode!r}")
+            job_rel = "silver/run_silver.py"
+            check_job(lakehouse, job_rel, where)
+            extra_args = ["--job", job_code]
+            job_desc = f"{yaml_rel} (via {job_rel})"
+            raw_parents = desc["job_parents"]
+        else:
+            check_job(lakehouse, py_rel, where)
+            job_rel = py_rel
+            extra_args = []
+            job_desc = py_rel
+            write_mode = None
+            raw_parents = []
+
+        if raw_parents and row["date_mode"] == "no_date":
+            raise ConfigError(f"{where} ({job_code}): a no_date table cannot have parents ({raw_parents})")
+
+        entry = {
+            "namespace": namespace, "table": table, "job_code": job_code, "flag_table": flag_table,
+            "job_rel": job_rel, "extra_args": extra_args, "job_desc": job_desc,
+            "date_mode": DATE_MODES[row["date_mode"]], "schedule": schedule_literal(row["schedule"], where),
+            "write_mode": write_mode, "raw_parents": raw_parents, "yaml_rel": yaml_rel,
+        }
+        entries.append(entry)
+        active_silver[flag_table] = entry
+
+    # Pass 2: resolve parents and check modes + cycles
+    silver_graph: Dict[str, List[str]] = {}
+    result = []
+    for e in entries:
+        where = f"{e['yaml_rel']} ({e['job_code']})"
+        sources: List[str] = []           # encoded specs for SOURCE_TABLES, e.g. "silver.base.dim_party@latest"
+        parent_pairs: List[Tuple[str, str]] = []   # (table_name, mode)
+        silver_parents: List[str] = []
+        for p_code in e["raw_parents"]:
+            layer, ns, tbl = _parse_parent_code(p_code, where)
+            p_table = f"{layer}.{ns}.{tbl}"
+            if p_table == e["flag_table"]:
+                raise ConfigError(f"{where}: table cannot be its own parent ({p_code})")
+            if layer == "bronze":
+                if p_table not in known_bronze:
+                    raise ConfigError(f"{where}: bronze parent {p_table} is not an active bronze table")
+                mode = "exact"
+                sources.append(p_table)
+            else:
+                if p_table not in active_silver:
+                    raise ConfigError(f"{where}: silver parent {p_table} is not an active row of silver_tables.csv")
+                p_mode = active_silver[p_table]["write_mode"]
+                if p_mode is None:
+                    raise ConfigError(f"{where}: silver parent {p_table} has no YAML target.write_mode")
+                mode = "latest" if p_mode in LATEST_WRITE_MODES else "exact"
+                sources.append(f"{p_table}@latest" if mode == "latest" else p_table)
+                silver_parents.append(p_table)
+            parent_pairs.append((p_table, mode))
+        silver_graph[e["flag_table"]] = silver_parents
+        e["sources"] = sources
+        e["parent_pairs"] = parent_pairs
+        e["parents_text"] = ", ".join(f"{t} ({m})" for t, m in parent_pairs) if parent_pairs else "none"
+        e["description"] = (f"Silver: {', '.join(t for t, _ in parent_pairs) if parent_pairs else '(no source table)'}"
+                            f" → {e['flag_table']}")
+        result.append(e)
+
+    _check_no_cycles(silver_graph)
     return result
 
 
@@ -176,15 +288,21 @@ def header(config_source: str) -> str:
 
 
 def task_file(dag_id: str, func: str, job_rel: str, date_mode: str, flag_table: str, description: str,
-              config_source: str, sources: Optional[List[str]] = None) -> str:
+              config_source: str, sources: Optional[List[str]] = None,
+              extra_args: Optional[List[str]] = None, job_desc: Optional[str] = None) -> str:
     sources_doc = sources_const = ""
     if sources is not None:
         sources_doc = (f"\nSource tables (flags checked before the job runs): {', '.join(sources)}"
                        if sources else "\nNo source table: nothing to check before the job runs.")
         sources_const = "\nSOURCE_TABLES = [" + ", ".join(f'"{s}"' for s in sources) + "]"
+    extra_args = extra_args or []
+    extra_args_const = ("\nEXTRA_ARGS = [" + ", ".join(f'"{a}"' for a in extra_args) + "]") if extra_args else ""
+    extra_args_kw = ", extra_args=EXTRA_ARGS" if extra_args else ""
+    job_cmd = " ".join([job_rel.rsplit("/", 1)[-1]] + extra_args)
     return render("job_task.py.tpl", header=header(config_source), dag_id=dag_id, func=func, job_rel=job_rel,
-                  job_file=job_rel.rsplit("/", 1)[-1], description=description, flag_table=flag_table,
-                  date_mode=date_mode, sources_doc=sources_doc, sources_const=sources_const)
+                  job_desc=job_desc or job_rel, job_cmd=job_cmd, description=description, flag_table=flag_table,
+                  date_mode=date_mode, extra_args_const=extra_args_const, extra_args_kw=extra_args_kw,
+                  sources_doc=sources_doc, sources_const=sources_const)
 
 
 def build_files(lakehouse: Path, tables_csv: Path) -> Dict[Path, str]:
@@ -211,36 +329,39 @@ def build_files(lakehouse: Path, tables_csv: Path) -> Dict[Path, str]:
             task_calls="\n".join(calls),
             order_text=" → ".join(f"ingest_{t['table']}" for t in entry["tables"]))
 
-    silver_source = "auto/config/silver_tables.csv"
-    for t in load_silver(lakehouse, bronze_tables):
+    silver_source = "auto/config/silver_tables.csv + LakeHouse YAML job_parents"
+    silver_list = load_silver(lakehouse, bronze_tables)
+    for t in silver_list:
         folder = DAGS_DIR / "silver" / t["namespace"]
         dag_id = f"silver__{t['table']}"
         func = f"load_{t['table']}"
-        flag_table = f"silver.{t['namespace']}.{t['table']}"
+        flag_table = t["flag_table"]
         files[folder / f"{dag_id}_task.py"] = task_file(dag_id, func, t["job_rel"], t["date_mode"], flag_table,
-                                                        t["description"], silver_source, sources=t["sources"])
+                                                        t["description"], silver_source, sources=t["sources"],
+                                                        extra_args=t["extra_args"], job_desc=t["job_desc"])
         if t["sources"]:
             body = f"check_flags_task(SOURCE_TABLES, DATE_MODE) >> {func}()"
             task_imports = f"DATE_MODE, SOURCE_TABLES, {func}"
             spark_job_imports = "check_flags_task, date_params, flag_check_params"
             params = "{**date_params(DATE_MODE), **flag_check_params()}"
             flow_text = f"check_source_flags → {func}"
-            flow_doc = (f"check_source_flags waits until {', '.join(t['sources'])} has a SUCCESS flag for every date "
-                        f"of the run;\n{func} then runs the job and writes the flags of {flag_table}.")
+            flow_doc = (f"Parents: {t['parents_text']}\n"
+                        f"check_source_flags waits until every parent is ready (exact: cob_dt = D; latest: cob_dt <= D);\n"
+                        f"{func} then runs the job and writes the flags of {flag_table}.")
         else:
             body = f"{func}()"
             task_imports = f"DATE_MODE, {func}"
             spark_job_imports = "date_params"
             params = "date_params(DATE_MODE)"
             flow_text = func
-            flow_doc = f"No source table to wait for; {func} runs the job and writes the flags of {flag_table}."
+            flow_doc = f"Parents: none\nNo parent to wait for; {func} runs the job and writes the flags of {flag_table}."
         files[folder / f"{dag_id}_dag.py"] = render(
             "silver_table_dag.py.tpl", header=header(silver_source), dag_id=dag_id, flag_table=flag_table,
-            description=t["description"], job_rel=t["job_rel"], flow_text=flow_text, flow_doc=flow_doc,
+            description=t["description"], job_rel=t["job_desc"], flow_text=flow_text, flow_doc=flow_doc,
             task_module=f"silver.{t['namespace']}.{dag_id}_task", task_imports=task_imports,
             spark_job_imports=spark_job_imports, schedule=t["schedule"], params=params,
             namespace=t["namespace"], body=body)
-    return files
+    return files, silver_list
 
 
 def generated_files_on_disk() -> List[Path]:
@@ -264,10 +385,16 @@ def main() -> int:
     tables_csv = args.bronze_tables or args.lakehouse_root / "jobs" / "auto" / "bronze_tables.csv"
 
     try:
-        files = build_files(args.lakehouse_root, tables_csv)
+        files, silver_list = build_files(args.lakehouse_root, tables_csv)
     except ConfigError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
+
+    if args.check:
+        print("Silver parents:")
+        for t in silver_list:
+            print(f"  {t['flag_table']:<40} {t['parents_text']}")
+        print()
 
     created = changed = unchanged = 0
     for path, content in sorted(files.items()):

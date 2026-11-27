@@ -47,5 +47,5 @@ DEFAULT_ARGS = {
 
 
 def job_path(relative_path: str) -> str:
-    """Full path, inside spark-client-dungafk, of a LakeHouse_Banking job, e.g. 'bronze/crm/bronze__customer.py'."""
+    """Full path, inside spark-client-dungafk, of a LakeHouse_Banking job, e.g. 'bronze/crm/bronze__crm__customer.py'."""
     return f"{LAKEHOUSE_JOBS_ROOT}/{relative_path}"

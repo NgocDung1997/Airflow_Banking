@@ -1,4 +1,5 @@
 domain,schedule,active
 crm,0 1 * * *,1
-core_banking,0 1 * * *,1
+t24,0 1 * * *,1
 payment,0 1 * * *,1
+los,0 1 * * *,1

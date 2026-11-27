@@ -123,23 +123,55 @@ def set_flags(table: str, dates: Iterable[date], status: str, run_info: Dict[str
     return len(dates)
 
 
+CHECK_MODES = ("exact", "latest")
+
+
+def parse_table_spec(spec: str) -> Tuple[str, str]:
+    """Parse '<layer>.<schema>.<table>[@exact|@latest]' → (table_name, mode). No suffix = 'exact'."""
+    if "@" in spec:
+        table, mode = spec.rsplit("@", 1)
+        if mode not in CHECK_MODES:
+            raise ValueError(f"unsupported flag check mode {mode!r} in {spec!r}; use {' or '.join(CHECK_MODES)}")
+        return table, mode
+    return spec, "exact"
+
+
 def not_ready(tables: Sequence[str], dates: Iterable[date]) -> List[Tuple[str, date, Optional[str]]]:
-    """(table, cob_dt, status or None) for every table / date whose flag is not SUCCESS. Empty list = all ready."""
+    """Return (table_spec, cob_dt, status or None) for every parent / date that is not ready. Empty list = all ready.
+
+    Each entry in `tables` may carry a mode suffix:
+        <table_name> or <table_name>@exact   ready for date D when status = 'SUCCESS' on cob_dt = D
+        <table_name>@latest                  ready for date D when a status = 'SUCCESS' row exists on cob_dt <= D
+                                             (missing rows return status None)
+    Runs one query per table (never one query per date).
+    """
     dates = list(dates)
-    wanted = [(t, d) for t in tables for d in dates]
-    if not wanted:
+    specs = [(spec, *parse_table_spec(spec)) for spec in tables]   # validate all specs upfront, even if dates is empty
+    if not specs or not dates:
         return []
+    missing: List[Tuple[str, date, Optional[str]]] = []
     with connect() as conn, conn.cursor() as cur:
-        found = {}
-        for table in tables:
+        for spec, table, mode in specs:
             layer, schema, name = split_table(table)
-            cur.execute("SELECT cob_dt, status FROM job_flag "
-                        "WHERE layer = %s AND schema_name = %s AND table_name = %s AND cob_dt = ANY(%s)",
-                        (layer, schema, name, dates))
-            for cob_dt, status in cur.fetchall():
-                found[(table, cob_dt)] = status
+            if mode == "exact":
+                cur.execute("SELECT cob_dt, status FROM job_flag "
+                            "WHERE layer = %s AND schema_name = %s AND table_name = %s AND cob_dt = ANY(%s)",
+                            (layer, schema, name, dates))
+                found = dict(cur.fetchall())
+                for d in dates:
+                    if found.get(d) != "SUCCESS":
+                        missing.append((spec, d, found.get(d)))
+            else:
+                # EXISTS (... AND status = 'SUCCESS' AND cob_dt <= D)  <=>  MIN(cob_dt of SUCCESS) <= D
+                cur.execute("SELECT MIN(cob_dt) FROM job_flag "
+                            "WHERE layer = %s AND schema_name = %s AND table_name = %s AND status = 'SUCCESS'",
+                            (layer, schema, name))
+                earliest = cur.fetchone()[0]
+                for d in dates:
+                    if earliest is None or earliest > d:
+                        missing.append((spec, d, None))
     conn.close()
-    return [(t, d, found.get((t, d))) for t, d in wanted if found.get((t, d)) != "SUCCESS"]
+    return missing
 
 
 def init_control_db() -> None:

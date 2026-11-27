@@ -1,9 +1,15 @@
-namespace,table,date_mode,schedule,source_tables,active
-base,dim_date,no_date,,,1
-base,dim_party,date_range,0 2 * * *,bronze.crm.customer,1
-base,dim_account,date_range,0 2 * * *,bronze.core_banking.account,1
-pii,dim_party_identity,date_range,15 2 * * *,bronze.crm.customer,1
-pii,dim_contact,date_range,15 2 * * *,bronze.crm.customer,1
-base,fact_account_balance,date_range,30 2 * * *,bronze.core_banking.account,1
-base,fact_transaction,date_range,30 2 * * *,bronze.core_banking.transaction,1
-base,fact_merchant_transaction,date_range,30 2 * * *,bronze.payment.merchant_transaction,1
+namespace,table,date_mode,schedule,active
+base,dim_date,no_date,,1
+base,dim_party,date_range,0 2 * * *,1
+base,dim_account,date_range,0 2 * * *,1
+pii,dim_party_identity,date_range,15 2 * * *,1
+pii,dim_contact,date_range,15 2 * * *,1
+base,fact_account_balance,date_range,30 2 * * *,1
+base,fact_transaction,date_range,30 2 * * *,1
+base,fact_merchant_transaction,date_range,30 2 * * *,1
+base,dim_dpd_classification,no_date,,1
+base,dim_loan_product,date_range,0 2 * * *,1
+base,dim_loan_contract,date_range,0 2 * * *,1
+base,fact_loan_balance,date_range,30 2 * * *,1
+base,fact_repayment,date_range,30 2 * * *,1
+base,fact_loan_application,date_range,30 2 * * *,1

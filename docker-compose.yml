@@ -48,7 +48,10 @@ services:
       POSTGRES_DB: ${AIRFLOW_DB_NAME}
     volumes:
       - airflow_postgres_data:/var/lib/postgresql/data
-    # No host port: only Airflow containers talk to it (host 5432 is taken by postgres-dungafk)
+    # Host port 5433 (host 5432 is taken by postgres-dungafk): DBeaver / psql access to etl_control (flags)
+    # and airflow_db. Airflow containers still use airflow-postgres-dungafk:5432 inside the Docker network.
+    ports:
+      - "5433:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${AIRFLOW_DB_USER} -d ${AIRFLOW_DB_NAME}"]
       interval: 10s

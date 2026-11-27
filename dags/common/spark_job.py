@@ -121,7 +121,7 @@ def _stream(command: List[str]) -> int:
 
 # ── Tasks ───────────────────────────────────────────────────────────────────────────────────────────────────
 def spark_job_task(task_id: str, job_path: str, date_mode: str, flag_table: str,
-                   trigger_rule: str = "all_success"):
+                   trigger_rule: str = "all_success", extra_args: Optional[Sequence[str]] = None):
     """Task that runs one LakeHouse_Banking job with docker exec + spark-submit and writes its flags.
 
     Args:
@@ -130,14 +130,16 @@ def spark_job_task(task_id: str, job_path: str, date_mode: str, flag_table: str,
         date_mode:    COB_DT_ONLY, DATE_RANGE or NO_DATE (which date options the job accepts).
         flag_table:   table the job writes, "<layer>.<schema>.<table>" — the flags are written for it.
         trigger_rule: "all_done" in a bronze domain DAG = run even when the table before failed.
+        extra_args:   optional arguments placed right after job_path (e.g. ["--job", "silver__base__dim_party"]).
     """
+    fixed_args = list(extra_args) if extra_args else []
 
     @task(task_id=task_id, pool=SPARK_POOL, trigger_rule=trigger_rule)
     def run_spark_job(params=None, dag_run=None, ti=None) -> str:
         date_options, dates, reason = resolve_dates(date_mode, params, dag_run)
         if date_options is None:
             raise AirflowSkipException(reason)
-        command = ["docker", "exec", SPARK_CLIENT_CONTAINER, "spark-submit", job_path] + date_options
+        command = ["docker", "exec", SPARK_CLIENT_CONTAINER, "spark-submit", job_path] + fixed_args + date_options
         log.info("Dates: %s | flags of %s: %s", reason, flag_table, [d.isoformat() for d in dates] or "none")
         log.info("Command: %s", " ".join(shlex.quote(part) for part in command))
         run_info = _run_info(ti)
@@ -174,8 +176,12 @@ def check_flags_task(source_tables: Sequence[str], date_mode: str, task_id: str 
             return PokeReturnValue(is_done=True)
         missing = flags.not_ready(source_tables, dates)
         if missing:
-            for table, cob_dt, status in missing:
-                log.info("Waiting: %s cob_dt %s is %s", table, cob_dt, status or "not loaded (no flag)")
+            for spec, cob_dt, status in missing:
+                table, mode = flags.parse_table_spec(spec)
+                if mode == "latest":
+                    log.info("Waiting: %s (latest ≤ %s) has no SUCCESS flag", table, cob_dt)
+                else:
+                    log.info("Waiting: %s cob_dt %s is %s", table, cob_dt, status or "not loaded (no flag)")
             return PokeReturnValue(is_done=False)
         log.info("All sources ready (%s): %s", reason, source_tables)
         return PokeReturnValue(is_done=True)

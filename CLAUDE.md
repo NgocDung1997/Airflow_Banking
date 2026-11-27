@@ -35,7 +35,10 @@ line in `known_issues/README.md` in the same turn. Never add git / Git Bash issu
   ones (`all_done`), and the run must still end failed (`domain_done`, `none_failed`). One `bronze__<table>_task.py`
   per table.
 - **Silver: one DAG per table** (`silver__<table>_dag.py` + `_task.py`): `check_source_flags` sensor → load. Silver
-  may run only when its bronze source tables have SUCCESS flags for the run's dates.
+  waits for both bronze **and** silver parents read directly from `job_description.job_parents` in each LakeHouse YAML
+  (`silver_tables.csv` has no `source_tables` column): bronze and fact parents use `exact` (`cob_dt = D`); silver
+  SCD1/2/3 dimension parents use `latest` (`cob_dt <= D`, encoded as `<table>@latest`). Python `no_date` jobs
+  (`dim_date`, `dim_dpd_classification`) have no parents and no check task.
 - Flags: database `etl_control` on airflow-postgres-dungafk (`job_flag`, `job_flag_history`), written by every Spark
   task (RUNNING → SUCCESS / FAILED), code `dags/common/flags.py`. Silver writes flags too (for gold later).
 - Tasks call jobs only with **`docker exec spark-client-dungafk spark-submit ...`** (user decision) — no Spark inside
@@ -58,7 +61,8 @@ line in `known_issues/README.md` in the same turn. Never add git / Git Bash issu
 
 - Airflow **3.3.2**, LocalExecutor, FAB auth manager, image `airflow-banking:3.3.2` (official image + docker CLI 27).
 - Containers `airflow-*-dungafk`, network `airflow-net-dungafk` (does NOT join `lakehouse-net-dungafk`).
-  UI on host port **8090** (8080 = Spark Master). Metadata Postgres 16 has no host port.
+  UI on host port **8090** (8080 = Spark Master). Metadata Postgres 16 (`airflow_db` + `etl_control`) on host
+  port **5433** (opened 2026-11-27 for DBeaver; host 5432 = LakeHouse `postgres-dungafk`, a different server).
 - Docker socket is mounted into the **scheduler only** (LocalExecutor runs tasks there). Access works because the
   socket is `root:root 660` and Airflow runs as `50000:0` (group root).
 - Default time zone `Asia/Ho_Chi_Minh`. Scheduled runs pass `--cob-dt` = run date (VN time) − 1 day, computed from
@@ -75,16 +79,14 @@ line in `known_issues/README.md` in the same turn. Never add git / Git Bash issu
 
 ## 3. Current status
 
-**Last updated:** 2026-11-26
-- Stack up and healthy; 11 generated DAGs (3 bronze domain DAGs, 8 silver table DAGs), no import errors, all paused.
-  The old per-table bronze DAGs were removed (files + metadata).
-- Verified 2026-11-26 (re-runs of a date already loaded, no data change):
-  - `bronze__crm` cob_dt 2026-11-23 → success, flag bronze.crm.customer 2026-11-23 SUCCESS.
-  - `silver__dim_party` cob_dt 2026-11-23 → check_source_flags passed at once → load success, flag SUCCESS.
-  - `check_source_flags` for cob_dt 2026-11-22 (no bronze flag) → waits ("not loaded (no flag)").
-  - Temporary DAG: failing job → FAILED flag, next table still ran (success), domain_done upstream_failed, run failed.
-    Temp DAG and its test flags were deleted.
-- Flags existing now: bronze.crm.customer + silver.base.dim_party for 2026-11-23 only. Older loaded dates have
-  no flags: a silver run for them waits — trigger the bronze domain DAG for that date first, or use `skip_flag_check`.
-- Not built yet: silver → silver dependencies (facts join dims; today only by schedule time 02:00 → 02:30),
-  DQ, gold. Nothing committed to git yet (remote origin = NgocDung1997/Airflow_Banking, branch main).
+**Last updated:** 2026-11-27
+- Stack up and healthy; 18 generated DAGs (4 bronze domain DAGs: `bronze__crm`, `bronze__t24`, `bronze__payment`, `bronze__los`;
+  14 silver table DAGs: 8 original + 6 LOS `dim_dpd_classification`, `dim_loan_product`, `dim_loan_contract`,
+  `fact_loan_balance`, `fact_repayment`, `fact_loan_application`), no import errors, all paused.
+- Silver → silver parent dependencies implemented (single source of truth = LakeHouse YAML `job_parents`; `exact` for
+  bronze & facts, `latest` for SCD1/2/3 dims; topological cycle detection in `generate_dags.py`).
+- `bronze__loan_application_task.py` switched to `COB_DT_ONLY` (snapshot).
+- Verified 2026-11-27: `not_ready` unit checks (`exact` / `latest` / invalid mode), cycle detection, waiting sensor
+  (`Waiting: ... (latest ≤ ...)`), and end-to-end `dags test` for `bronze__los`, `silver__fact_transaction`,
+  `silver__dim_loan_product`, `silver__dim_loan_contract`, `silver__fact_loan_balance` on `2026-11-23`.
+- Not built yet: DQ, gold. Nothing committed to git yet (remote origin = NgocDung1997/Airflow_Banking, branch main).

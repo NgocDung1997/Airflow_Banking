@@ -47,6 +47,8 @@ docker exec airflow-scheduler-dungafk airflow dags list-import-errors
 docker exec airflow-postgres-dungafk psql -U airflow_dungnn -d etl_control -c "SELECT layer, schema_name, table_name, cob_dt, status, finished_at, message FROM job_flag ORDER BY cob_dt DESC, layer, table_name"
 ```
 
+- DBeaver / any client: host `localhost`, port **5433** (not 5432 — that is the LakeHouse Postgres), database
+  `etl_control` (or `airflow_db`), user / password = `AIRFLOW_DB_USER` / `AIRFLOW_DB_PASSWORD` in `.env`.
 - History of every change: table `job_flag_history`.
 - To force a re-check, fix the source (re-run the bronze table) — do not edit flags by hand unless you know why.
 
@@ -54,8 +56,11 @@ docker exec airflow-postgres-dungafk psql -U airflow_dungnn -d etl_control -c "S
 
 1. Bronze: add the table to `LakeHouse_Banking/jobs/auto/bronze_tables.csv` and generate its LakeHouse job first
    (see LakeHouse_Banking/how_to_run.md). A new domain also needs a line in `dags/auto/config/bronze_domains.csv`.
-2. Silver: create the LakeHouse job `jobs/silver/<ns>/silver__<table>.py`, then add a line to
-   `dags/auto/config/silver_tables.csv` (`source_tables` = flags to wait for, `|`-separated).
+2. Silver: create the LakeHouse job `jobs/silver/<ns>/silver__<ns>__<table>.yaml` (executed via `silver/run_silver.py`)
+   or `jobs/silver/<ns>/silver__<ns>__<table>.py`, then add a line to `dags/auto/config/silver_tables.csv`
+   (`namespace,table,date_mode,schedule,active`). Parent dependencies are read automatically from `job_parents` in the
+   LakeHouse YAML (`exact` for bronze and silver facts; `latest` for silver SCD1/2/3 dimensions). Python jobs without
+   YAML (`dim_date`, `dim_dpd_classification`) have no parents and no check task.
 3. Generate:
 
 ```powershell

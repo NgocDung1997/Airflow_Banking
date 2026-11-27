@@ -31,23 +31,35 @@ Commands: [how_to_run.md](how_to_run.md) · Problems already met: [known_issues/
 | DAG | Tasks | Schedule (Vietnam time) |
 |---|---|---|
 | bronze__crm | ingest_customer → domain_done | 01:00 |
-| bronze__core_banking | ingest_account → ingest_core_account → ingest_transaction → domain_done | 01:00 |
+| bronze__t24 | ingest_account → ingest_core_account → ingest_transaction → domain_done | 01:00 |
 | bronze__payment | ingest_merchant_transaction → domain_done | 01:00 |
+| bronze__los | ingest_loan_product → ingest_loan_application → ingest_loan_contract → ingest_repayment → domain_done | 01:00 |
+| bronze__los | ingest_loan_product → ingest_loan_application → ingest_loan_contract → ingest_repayment → domain_done | 01:00 |
 | silver__dim_date | load_dim_date | manual only |
-| silver__dim_party | check_source_flags (bronze.crm.customer) → load_dim_party | 02:00 |
-| silver__dim_account | check_source_flags (bronze.core_banking.account) → load_dim_account | 02:00 |
-| silver__dim_party_identity | check_source_flags (bronze.crm.customer) → load_dim_party_identity | 02:15 |
-| silver__dim_contact | check_source_flags (bronze.crm.customer) → load_dim_contact | 02:15 |
-| silver__fact_account_balance | check_source_flags (bronze.core_banking.account) → load_fact_account_balance | 02:30 |
-| silver__fact_transaction | check_source_flags (bronze.core_banking.transaction) → load_fact_transaction | 02:30 |
-| silver__fact_merchant_transaction | check_source_flags (bronze.payment.merchant_transaction) → load_fact_merchant_transaction | 02:30 |
+| silver__dim_dpd_classification | load_dim_dpd_classification | manual only |
+| silver__dim_party | check_source_flags (bronze.crm.customer exact) → load_dim_party | 02:00 |
+| silver__dim_account | check_source_flags (bronze.t24.account exact) → load_dim_account | 02:00 |
+| silver__dim_loan_product | check_source_flags (bronze.los.loan_product exact) → load_dim_loan_product | 02:00 |
+| silver__dim_loan_contract | check_source_flags (bronze.los.loan_contract exact) → load_dim_loan_contract | 02:00 |
+| silver__dim_party_identity | check_source_flags (bronze.crm.customer exact) → load_dim_party_identity | 02:15 |
+| silver__dim_contact | check_source_flags (bronze.crm.customer exact) → load_dim_contact | 02:15 |
+| silver__fact_account_balance | check_source_flags (bronze.t24.account exact; silver.base.dim_account, dim_party latest) → load_fact_account_balance | 02:30 |
+| silver__fact_transaction | check_source_flags (bronze.t24.transaction exact; silver.base.dim_account, dim_party latest) → load_fact_transaction | 02:30 |
+| silver__fact_merchant_transaction | check_source_flags (bronze.payment.merchant_transaction exact) → load_fact_merchant_transaction | 02:30 |
+| silver__fact_loan_balance | check_source_flags (bronze.los.loan_contract exact; dim_loan_contract, dim_loan_product, dim_party, dim_account latest) → load_fact_loan_balance | 02:30 |
+| silver__fact_repayment | check_source_flags (bronze.los.repayment exact; dim_loan_contract, dim_loan_product, dim_party latest) → load_fact_repayment | 02:30 |
+| silver__fact_loan_application | check_source_flags (bronze.los.loan_application, loan_contract exact; dim_party, dim_loan_product latest) → load_fact_loan_application | 02:30 |
 
 **Bronze — one DAG per domain.** Tables run one after another in the order of `bronze_tables.csv`. A failed table
 does **not** stop the next ones (`trigger_rule="all_done"`); the last task `domain_done` (`none_failed`) then becomes
 `upstream_failed`, so the run shows as failed and the failed table is easy to spot (clear that task to re-run it).
 
-**Silver — one DAG per table, with a flag check.** `check_source_flags` is a sensor (reschedule mode, every 1 min,
-up to 4 h) that waits until every source table has a `SUCCESS` flag for every date of the run; only then the load runs.
+**Silver — one DAG per table, with bronze + silver parent flag checks.** Parent dependencies come directly from
+`job_description.job_parents` in each LakeHouse YAML (single source of truth; `silver_tables.csv` has no
+`source_tables` column). `check_source_flags` is a sensor (reschedule mode, every 1 min, up to 4 h) with two modes:
+- **`exact`** (bronze parents and silver `overwrite_partitions` / `append` parents): requires `SUCCESS` on `cob_dt = D`.
+- **`latest`** (silver `scd1` / `scd2` / `scd3` dimension parents, encoded as `<table_name>@latest`): requires any
+  `SUCCESS` flag on `cob_dt <= D`, so backfilling facts is not blocked by dim dates.
 
 ## Flags (`etl_control` database)
 
@@ -76,7 +88,7 @@ dags/auto/
 ├── generate_dags.py            # python dags/auto/generate_dags.py  (writes / updates / deletes generated files)
 ├── config/
 │   ├── bronze_domains.csv      # domain, schedule, active
-│   └── silver_tables.csv       # namespace, table, date_mode, schedule, source_tables ("|"-separated), active
+│   └── silver_tables.csv       # namespace, table, date_mode, schedule, active (parents from LakeHouse YAML job_parents)
 └── templates/                  # job_task.py.tpl, bronze_domain_dag.py.tpl, silver_table_dag.py.tpl
 ```
 
